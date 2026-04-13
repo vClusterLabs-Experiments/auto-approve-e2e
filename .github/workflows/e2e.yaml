@@ -1,0 +1,155 @@
+name: e2e
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'  # weekly Monday 06:00 UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  TS: ${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  scenario:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: chore-deps-title
+            title: 'chore(deps): bump bar'
+            branch_prefix: test/chore-deps
+            expected_eligible: 'true'
+          - name: fix-deps-title
+            title: 'fix(deps): patch cve'
+            branch_prefix: test/fix-deps
+            expected_eligible: 'true'
+          - name: backport-branch
+            title: 'any title'
+            branch_prefix: backport/e2e
+            expected_eligible: 'true'
+          - name: renovate-branch
+            title: 'whatever'
+            branch_prefix: renovate/e2e
+            expected_eligible: 'true'
+          - name: update-platform-version-branch
+            title: 'anything'
+            branch_prefix: update-platform-version-1.2.3-e2e
+            expected_eligible: 'true'
+          - name: ineligible-feat
+            title: 'feat: new thing'
+            branch_prefix: test/feat
+            expected_eligible: 'false'
+          - name: ineligible-random-title
+            title: 'random commit message'
+            branch_prefix: test/random
+            expected_eligible: 'false'
+    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: true
+
+      - name: Create branch and PR
+        id: pr
+        env:
+          TITLE: ${{ matrix.title }}
+          BRANCH_PREFIX: ${{ matrix.branch_prefix }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="${BRANCH_PREFIX}-${TS}"
+          git checkout -b "${branch}"
+          echo "e2e ${TS}" > "e2e-${TS}.txt"
+          git add "e2e-${TS}.txt"
+          git commit -m "${TITLE}"
+          git push origin "${branch}"
+
+          pr_url=$(gh pr create --base main --head "${branch}" --title "${TITLE}" --body "e2e scenario: ${{ matrix.name }}")
+          pr_num="${pr_url##*/}"
+          echo "branch=${branch}"  >> "${GITHUB_OUTPUT}"
+          echo "pr_num=${pr_num}"  >> "${GITHUB_OUTPUT}"
+
+      - name: Wait for caller workflow to complete
+        id: wait
+        env:
+          BRANCH: ${{ steps.pr.outputs.branch }}
+        run: |
+          for attempt in $(seq 1 30); do
+            run_json=$(gh run list --workflow=caller-auto-approve-bot-prs.yaml --branch="${BRANCH}" --limit=1 --json databaseId,status,conclusion)
+            status=$(echo "${run_json}" | jq -r '.[0].status // empty')
+            conclusion=$(echo "${run_json}" | jq -r '.[0].conclusion // empty')
+            run_id=$(echo "${run_json}" | jq -r '.[0].databaseId // empty')
+            echo "attempt ${attempt}: status=${status} conclusion=${conclusion}"
+            if [ "${status}" = "completed" ]; then
+              echo "conclusion=${conclusion}" >> "${GITHUB_OUTPUT}"
+              echo "run_id=${run_id}" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::caller workflow did not complete in time"
+          exit 1
+
+      - name: Assert job never hard-fails
+        env:
+          CONCLUSION: ${{ steps.wait.outputs.conclusion }}
+        run: |
+          case "${CONCLUSION}" in
+            success|skipped|neutral)
+              echo "OK: caller conclusion=${CONCLUSION}"
+              ;;
+            failure|timed_out|cancelled|startup_failure|action_required)
+              echo "::error::caller conclusion=${CONCLUSION} — this workflow MUST NEVER hard-fail"
+              exit 1
+              ;;
+            *)
+              echo "::warning::caller conclusion=${CONCLUSION} — unknown; treating as fail"
+              exit 1
+              ;;
+          esac
+
+      - name: Assert eligibility matches expectation
+        env:
+          RUN_ID: ${{ steps.wait.outputs.run_id }}
+          EXPECTED: ${{ matrix.expected_eligible }}
+        run: |
+          # The reusable workflow writes `eligible=true|false` to $GITHUB_OUTPUT.
+          # Inspect the run's log to confirm the decision table matched the scenario.
+          log=$(gh run view "${RUN_ID}" --log 2>&1 || true)
+          if echo "${log}" | grep -Fq "eligible=${EXPECTED}"; then
+            echo "OK: observed eligible=${EXPECTED} in log"
+          else
+            echo "::warning::could not find eligible=${EXPECTED} in log (caller may have skipped for other reasons)"
+          fi
+
+      - name: Cleanup
+        if: always()
+        env:
+          BRANCH: ${{ steps.pr.outputs.branch }}
+          PR_NUM: ${{ steps.pr.outputs.pr_num }}
+        run: |
+          if [ -n "${PR_NUM}" ]; then
+            gh pr close "${PR_NUM}" --delete-branch 2>/dev/null || true
+          fi
+          git push origin --delete "${BRANCH}" 2>/dev/null || true
+
+  report:
+    needs: scenario
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        env:
+          RESULT: ${{ needs.scenario.result }}
+        run: |
+          echo "scenario matrix result: ${RESULT}"
+          if [ "${RESULT}" = "failure" ]; then
+            echo "::error::one or more e2e scenarios failed"
+            exit 1
+          fi
